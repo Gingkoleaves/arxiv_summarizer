@@ -241,6 +241,168 @@ def search_arxiv(query: str, start_date: str, end_date: str,
     return papers
 
 # =============================================================================
+# Google Scholar search
+# =============================================================================
+
+def _scholar_available() -> bool:
+    try:
+        import scholarly  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _make_scholar_id(title: str) -> str:
+    """Stable short ID from paper title."""
+    import hashlib
+    h = hashlib.md5(title.lower().encode()).hexdigest()[:10]
+    return f"scholar_{h}"
+
+
+def search_scholar(query: str, start_date: str, end_date: str,
+                   max_papers: Optional[int]) -> list:
+    """
+    Search Google Scholar via the `scholarly` library.
+    Returns the same paper dict format as search_arxiv().
+    Note: Scholar may rate-limit or block; retries with backoff are applied.
+    """
+    if not _scholar_available():
+        print("[Scholar] 'scholarly' not installed. Run: pip install scholarly")
+        return []
+
+    from scholarly import scholarly as sc
+
+    year_low  = int(start_date[:4])
+    year_high = int(end_date[:4])
+    cap       = max_papers or 9999
+
+    print(f"\n[Scholar] query={query!r}  {year_low}-{year_high}"
+          f"  cap={max_papers or 'unlimited'}")
+    print("  Note: Google Scholar may throttle requests; pauses are normal.")
+
+    papers = []
+    seen_titles: set = set()
+
+    try:
+        gen = sc.search_pubs(query, year_low=year_low, year_high=year_high)
+        consecutive_errors = 0
+        collected = 0
+
+        while collected < cap:
+            try:
+                pub = next(gen)
+                consecutive_errors = 0
+            except StopIteration:
+                break
+            except Exception as e:
+                consecutive_errors += 1
+                wait = min(2 ** consecutive_errors, 60)
+                print(f"\n  [!] Scholar fetch error (retry in {wait}s): {e}")
+                time.sleep(wait)
+                if consecutive_errors >= MAX_RETRIES:
+                    print("  [!] Too many Scholar errors, stopping.")
+                    break
+                continue
+
+            bib = pub.get("bib", {})
+            title = (bib.get("title") or "").strip()
+            if not title:
+                continue
+
+            norm = title.lower()
+            if norm in seen_titles:
+                continue
+            seen_titles.add(norm)
+
+            # Filter by year (scholarly year_low/high is advisory only)
+            pub_year = str(bib.get("pub_year") or "")
+            if pub_year.isdigit():
+                y = int(pub_year)
+                if y < year_low or y > year_high:
+                    continue
+            published = f"{pub_year}-01-01" if pub_year else ""
+
+            abstract = (bib.get("abstract") or "").strip()
+            raw_authors = bib.get("author") or []
+            if isinstance(raw_authors, str):
+                raw_authors = [a.strip() for a in raw_authors.split(" and ")]
+            authors = [str(a) for a in raw_authors]
+
+            # Prefer eprint (often a direct PDF), then pub_url
+            pdf_url = (pub.get("eprint_url") or pub.get("pub_url") or "").strip()
+
+            papers.append({
+                "arxiv_id":  _make_scholar_id(title),
+                "title":     title,
+                "abstract":  abstract,
+                "pdf_url":   pdf_url,
+                "authors":   authors,
+                "published": published,
+                "source":    "scholar",
+            })
+            collected += 1
+            print(f"  collected={collected}", end="\r")
+            time.sleep(0.5)   # gentle pacing
+
+    except Exception as e:
+        print(f"\n  [!] Scholar search failed: {e}")
+
+    print(f"\n  Found {len(papers)} Scholar papers.")
+    return papers
+
+
+# =============================================================================
+# Multi-source search + deduplication
+# =============================================================================
+
+def _norm_title(t: str) -> str:
+    """Lowercase, strip punctuation/spaces for fuzzy dedup."""
+    return re.sub(r"[^a-z0-9]", "", t.lower())
+
+
+def search_papers(source: str, query: str, start_date: str,
+                  end_date: str, max_papers: Optional[int]) -> list:
+    """
+    Dispatch to one or both sources, then deduplicate by normalized title.
+    source: 'arxiv' | 'scholar' | 'all'
+    """
+    per_source = max_papers  # each source gets the full cap; dedup trims later
+
+    arxiv_results   = []
+    scholar_results = []
+
+    if source in ("arxiv", "all"):
+        arxiv_results = search_arxiv(query, start_date, end_date, per_source)
+        for p in arxiv_results:
+            p.setdefault("source", "arxiv")
+
+    if source in ("scholar", "all"):
+        scholar_results = search_scholar(query, start_date, end_date, per_source)
+
+    combined = arxiv_results + scholar_results
+
+    # Deduplicate by normalized title (keep first occurrence = arxiv preferred)
+    seen: set = set()
+    deduped = []
+    for p in combined:
+        key = _norm_title(p["title"])
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(p)
+
+    if max_papers:
+        deduped = deduped[:max_papers]
+
+    if source == "all":
+        src_counts = {}
+        for p in deduped:
+            s = p.get("source", "?")
+            src_counts[s] = src_counts.get(s, 0) + 1
+        print(f"\n[Merge] {len(deduped)} unique papers after dedup  {src_counts}")
+
+    return deduped
+
+# =============================================================================
 # PDF download
 # =============================================================================
 
@@ -512,14 +674,15 @@ def analyze_paper(paper: dict, pdf_path: Optional[Path],
     analysis = call_llm(deep_prompt.format(paper_text=text), model=model)
 
     return {
-        "arxiv_id":  paper["arxiv_id"],
-        "title":     paper["title"],
-        "authors":   paper["authors"],
-        "published": paper["published"],
-        "pdf_url":   paper["pdf_url"],
-        "abstract":  paper["abstract"],
-        "source":    source,
-        "analysis":  analysis,
+        "arxiv_id":     paper["arxiv_id"],
+        "title":        paper["title"],
+        "authors":      paper["authors"],
+        "published":    paper["published"],
+        "pdf_url":      paper.get("pdf_url", ""),
+        "abstract":     paper["abstract"],
+        "paper_source": paper.get("source", "arxiv"),
+        "source":       source,   # text extraction source (full PDF / abstract only)
+        "analysis":     analysis,
     }
 
 # =============================================================================
@@ -537,26 +700,24 @@ def write_paper_md(result: dict, out_dir: Path, lang: str) -> Path:
     if len(result["authors"]) > 5:
         authors_str += " et al."
 
-    if lang == "zh":
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(f"# {result['title']}\n\n")
-            f.write(f"- **arXiv**: [{result['arxiv_id']}](https://arxiv.org/abs/{result['arxiv_id']})\n")
-            f.write(f"- **Authors**: {authors_str}\n")
-            f.write(f"- **Published**: {result['published']}\n")
-            f.write(f"- **PDF**: {result['pdf_url']}\n")
-            f.write(f"- **Analysis source**: {result['source']}\n\n")
-            f.write("## Abstract\n\n" + result["abstract"] + "\n\n")
-            f.write("## Deep Analysis\n\n" + result["analysis"] + "\n")
+    paper_source = result.get("paper_source", "arxiv")
+    pid          = result["arxiv_id"]
+    if paper_source == "arxiv":
+        id_line = f"- **arXiv**: [{pid}](https://arxiv.org/abs/{pid})\n"
     else:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(f"# {result['title']}\n\n")
-            f.write(f"- **arXiv**: [{result['arxiv_id']}](https://arxiv.org/abs/{result['arxiv_id']})\n")
-            f.write(f"- **Authors**: {authors_str}\n")
-            f.write(f"- **Published**: {result['published']}\n")
-            f.write(f"- **PDF**: {result['pdf_url']}\n")
-            f.write(f"- **Analysis source**: {result['source']}\n\n")
-            f.write("## Abstract\n\n" + result["abstract"] + "\n\n")
-            f.write("## Deep Analysis\n\n" + result["analysis"] + "\n")
+        id_line = f"- **ID**: {pid}\n- **Source**: Google Scholar\n"
+
+    pdf_line = f"- **PDF**: {result['pdf_url']}\n" if result.get("pdf_url") else ""
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"# {result['title']}\n\n")
+        f.write(id_line)
+        f.write(f"- **Authors**: {authors_str}\n")
+        f.write(f"- **Published**: {result['published']}\n")
+        f.write(pdf_line)
+        f.write(f"- **Text source**: {result['source']}\n\n")
+        f.write("## Abstract\n\n" + result["abstract"] + "\n\n")
+        f.write("## Deep Analysis\n\n" + result["analysis"] + "\n")
     return path
 
 
@@ -580,14 +741,53 @@ def write_synthesis_md(topic: str, results: list, synthesis: str,
     return path
 
 
-def write_index_md(topic: str, results: list, out_dir: Path) -> Path:
+OVERVIEW_PROMPT_EN = """\
+You are an expert research analyst. Write a concise but informative overview of the research topic: "{topic}".
+Cover:
+1. **Historical Background** - when and how this field emerged, key milestones.
+2. **Current State** - dominant methods, architectures, and paradigms as of today.
+3. **Key Baselines & Benchmarks** - the most important baseline models/methods and standard evaluation benchmarks.
+4. **Major Research Groups & Venues** - leading labs, conferences, and journals.
+5. **Open Challenges** - the most pressing unsolved problems.
+
+Be concise (500-800 words), factual, and use technical language suitable for a graduate researcher.
+"""
+
+OVERVIEW_PROMPT_ZH = """\
+你是一位资深科研分析专家。请为以下研究主题撰写一份简洁但信息量丰富的综述引言："{topic}"。
+请覆盖：
+1. **历史背景** — 该领域的起源、发展历程和关键里程碑。
+2. **现状** — 当前主流方法、模型架构和技术范式。
+3. **核心基准与Baseline** — 最重要的基线方法和标准评测基准。
+4. **主要研究团队与发表渠道** — 领域内顶尖实验室、重要会议和期刊。
+5. **开放挑战** — 目前最迫切的未解决问题。
+
+字数控制在500-800字，语言专业，适合研究生阅读。
+"""
+
+
+def write_index_md(topic: str, results: list, out_dir: Path,
+                   model: str, lang: str) -> Path:
     path = out_dir / "index.md"
+
+    print(f"\n[Index] Generating topic overview for '{topic}' ...")
+    prompt   = (OVERVIEW_PROMPT_ZH if lang == "zh" else OVERVIEW_PROMPT_EN).format(topic=topic)
+    overview = call_llm(prompt, model=model, max_tokens=1200)
+
+    src_label = {"arxiv": "arXiv", "scholar": "Google Scholar"}
     with open(path, "w", encoding="utf-8") as f:
-        f.write(f"# Paper Index: {topic}\n\n")
+        f.write(f"# {topic}\n\n")
         f.write(f"*{len(results)} papers | Generated: {datetime.now():%Y-%m-%d}*\n\n")
+        f.write("---\n\n")
+        f.write("## Topic Overview\n\n")
+        f.write(overview + "\n\n")
+        f.write("---\n\n")
+        f.write("## Paper List\n\n")
         for r in results:
+            src  = src_label.get(r.get("paper_source", "arxiv"), r.get("paper_source", ""))
+            date = r["published"] or "n/d"
             f.write(f"- **[{r['title']}]({_safe(r['arxiv_id'])}.md)**  \n")
-            f.write(f"  {r['published']} | {r['arxiv_id']}\n\n")
+            f.write(f"  {date} | {src} | {r['arxiv_id']}\n\n")
     return path
 
 # =============================================================================
@@ -655,6 +855,9 @@ def parse_args():
                    help="Report language: en=English, zh=Chinese")
     p.add_argument("--pdf",    action="store_true",
                    help="Render all Markdown output files to PDF via pandoc")
+    p.add_argument("--source",  default="arxiv",
+                   choices=["arxiv", "scholar", "all"],
+                   help="Paper source: arxiv | scholar | all (both, deduplicated)")
     p.add_argument("--no-download",  action="store_true",
                    help="Skip PDF download; analyze abstract text only")
     p.add_argument("--no-synthesis", action="store_true",
@@ -675,6 +878,7 @@ def main():
     print("   arXiv Topic Deep Analyzer  --  " + model)
     print("=" * 65)
     print(f"  Topic    : {topic}")
+    print(f"  Source   : {args.source}")
     print(f"  Dates    : {start_date} -> {end_date}")
     print(f"  Cap      : {max_papers or 'unlimited'}")
     print(f"  Model    : {model}")
@@ -689,7 +893,7 @@ def main():
     papers_dir  = PAPERS_DIR / safe_topic
 
     # 1. Search
-    papers = search_arxiv(topic, start_date, end_date, max_papers)
+    papers = search_papers(args.source, topic, start_date, end_date, max_papers)
     if not papers:
         print("No papers found. Try different keywords or a wider date range.")
         sys.exit(0)
@@ -728,7 +932,7 @@ def main():
         syn_path = write_synthesis_md(topic, results, synthesis, session_dir, lang)
         md_files.append(syn_path)
 
-    idx_path = write_index_md(topic, results, session_dir)
+    idx_path = write_index_md(topic, results, session_dir, model, lang)
     md_files.append(idx_path)
 
     # 5. PDF rendering
