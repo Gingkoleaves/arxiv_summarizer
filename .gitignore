@@ -1,0 +1,17 @@
+# 🔥 Paper download
+downloaded_papers/
+
+# 🔥 Analyze output
+analysis_output/
+
+# tmp files
+*.log
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
