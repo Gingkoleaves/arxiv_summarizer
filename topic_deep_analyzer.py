@@ -772,7 +772,7 @@ def write_index_md(topic: str, results: list, out_dir: Path,
 
     print(f"\n[Index] Generating topic overview for '{topic}' ...")
     prompt   = (OVERVIEW_PROMPT_ZH if lang == "zh" else OVERVIEW_PROMPT_EN).format(topic=topic)
-    overview = call_llm(prompt, model=model, max_tokens=1200)
+    overview = call_llm(prompt, model=model, max_tokens=3000)
 
     src_label = {"arxiv": "arXiv", "scholar": "Google Scholar"}
     with open(path, "w", encoding="utf-8") as f:
