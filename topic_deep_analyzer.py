@@ -18,6 +18,7 @@ Usage:
     python topic_deep_analyzer.py --topic "NeRF" --start 2024-01-01 --lang zh --pdf
 """
 
+import hashlib
 import requests
 import urllib.request
 import urllib.parse
@@ -84,7 +85,8 @@ PAPERS_DIR = Path("downloaded_papers")
 
 def _detect_pdf_backend() -> Optional[str]:
     try:
-        import fitz  # noqa: F401
+        import fitz
+        fitz.TOOLS.mupdf_display_errors(False)   # suppress C-level stderr noise
         return "pymupdf"
     except ImportError:
         pass
@@ -104,8 +106,11 @@ def extract_text_from_pdf(pdf_path: Path, char_limit: int = PDF_TEXT_LIMIT) -> s
         try:
             doc = fitz.open(str(pdf_path))
             parts, total = [], 0
-            for page in doc:
-                t = page.get_text()
+            for page_num in range(len(doc)):
+                try:
+                    t = doc[page_num].get_text()
+                except Exception:
+                    continue   # skip corrupt/unreadable pages silently
                 parts.append(t)
                 total += len(t)
                 if total >= char_limit:
@@ -254,7 +259,6 @@ def _scholar_available() -> bool:
 
 def _make_scholar_id(title: str) -> str:
     """Stable short ID from paper title."""
-    import hashlib
     h = hashlib.md5(title.lower().encode()).hexdigest()[:10]
     return f"scholar_{h}"
 
@@ -352,6 +356,472 @@ def search_scholar(query: str, start_date: str, end_date: str,
 
 
 # =============================================================================
+# PubMed search (NCBI E-utilities)
+# =============================================================================
+
+PUBMED_ESEARCH  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+PUBMED_EFETCH   = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+PUBMED_OA_API   = "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi"
+PUBMED_DELAY    = 0.35   # NCBI allows ~3 req/s without API key
+
+
+def _resolve_pmc_pdf_url(pmc_id: str) -> str:
+    """
+    Use the PMC Open Access API to get a direct HTTPS PDF link.
+    Falls back to the standard PMC article URL if the paper is not in OA subset.
+    """
+    try:
+        resp = requests.get(PUBMED_OA_API,
+                            params={"id": f"PMC{pmc_id}", "format": "pdf"},
+                            timeout=15)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+        for link in root.findall(".//link"):
+            fmt  = link.get("format", "")
+            href = link.get("href", "")
+            if fmt == "pdf" and href:
+                # Convert ftp:// → https://
+                return href.replace("ftp://ftp.ncbi.nlm.nih.gov",
+                                    "https://ftp.ncbi.nlm.nih.gov")
+    except Exception:
+        pass
+    # Fallback: new PMC domain (avoids the old redirect/HHS page)
+    return f"https://pmc.ncbi.nlm.nih.gov/articles/PMC{pmc_id}/pdf/"
+
+
+def _pubmed_fetch_xml(pmids: list) -> bytes:
+    """Batch-fetch PubMed XML for a list of PMIDs."""
+    params = {
+        "db":      "pubmed",
+        "id":      ",".join(pmids),
+        "retmode": "xml",
+        "rettype": "abstract",
+    }
+    try:
+        resp = requests.get(PUBMED_EFETCH, params=params, timeout=60)
+        resp.raise_for_status()
+        return resp.content
+    except Exception as e:
+        print(f"  [!] PubMed efetch error: {e}")
+        return b""
+
+
+def _parse_pubmed_xml(xml_bytes: bytes) -> list:
+    """Parse PubMed XML into paper dicts."""
+    papers = []
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return papers
+
+    for article in root.findall(".//PubmedArticle"):
+        citation = article.find("MedlineCitation")
+        if citation is None:
+            continue
+
+        pmid_tag = citation.find("PMID")
+        pmid = pmid_tag.text.strip() if pmid_tag is not None else ""
+
+        art = citation.find("Article")
+        if art is None:
+            continue
+
+        # Title
+        title_tag = art.find("ArticleTitle")
+        title = (title_tag.text or "").strip() if title_tag is not None else ""
+        title = re.sub(r"<[^>]+>", "", title)  # strip inline XML tags
+
+        # Abstract (may have multiple AbstractText elements)
+        abstract_parts = []
+        for at in art.findall(".//AbstractText"):
+            label = at.get("Label", "")
+            text  = (at.text or "").strip()
+            if label:
+                abstract_parts.append(f"{label}: {text}")
+            elif text:
+                abstract_parts.append(text)
+        abstract = " ".join(abstract_parts)
+
+        # Authors
+        authors = []
+        for au in art.findall(".//Author"):
+            ln = au.findtext("LastName", "")
+            fn = au.findtext("ForeName", "")
+            col = au.findtext("CollectiveName", "")
+            name = f"{fn} {ln}".strip() if (fn or ln) else col
+            if name:
+                authors.append(name)
+
+        # Publication date
+        pub_date = ""
+        for date_path in ("Journal/JournalIssue/PubDate",
+                          "ArticleDate"):
+            d = art.find(date_path)
+            if d is not None:
+                year  = d.findtext("Year",  "")
+                month = d.findtext("Month", "01")
+                day   = d.findtext("Day",   "01")
+                # Month may be abbreviated (Jan, Feb…)
+                month_map = {"Jan":"01","Feb":"02","Mar":"03","Apr":"04",
+                             "May":"05","Jun":"06","Jul":"07","Aug":"08",
+                             "Sep":"09","Oct":"10","Nov":"11","Dec":"12"}
+                month = month_map.get(month, month).zfill(2)
+                day   = day.zfill(2)
+                if year:
+                    pub_date = f"{year}-{month}-{day}"
+                    break
+
+        # PMC ID → free full-text PDF
+        pmc_id  = ""
+        doi_val = ""
+        for aid in article.findall(".//ArticleId"):
+            if aid.get("IdType") == "pmc":
+                pmc_id = (aid.text or "").strip().lstrip("PMC")
+            if aid.get("IdType") == "doi":
+                doi_val = (aid.text or "").strip()
+
+        if pmc_id:
+            pdf_url = _resolve_pmc_pdf_url(pmc_id)
+        elif doi_val:
+            pdf_url = f"https://doi.org/{doi_val}"
+        else:
+            pdf_url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+
+        if not title:
+            continue
+
+        papers.append({
+            "arxiv_id":  f"pubmed_{pmid}",
+            "title":      title,
+            "abstract":   abstract,
+            "pdf_url":    pdf_url,
+            "authors":    authors,
+            "published":  pub_date,
+            "source":     "pubmed",
+            "pmc_id":     pmc_id,
+        })
+    return papers
+
+
+def search_pubmed(query: str, start_date: str, end_date: str,
+                  max_papers: Optional[int]) -> list:
+    """Search PubMed via NCBI E-utilities (esearch → efetch XML)."""
+    cap = max_papers or 500
+
+    # Build date-range term (YYYY/MM/DD format for PubMed)
+    sd = start_date.replace("-", "/")
+    ed = end_date.replace("-", "/")
+    term = f'({query})[Title/Abstract] AND ("{sd}"[Date - Publication] : "{ed}"[Date - Publication])'
+
+    print(f"\n[PubMed] query={query!r}  {start_date} -> {end_date}"
+          f"  cap={max_papers or 'unlimited'}")
+
+    # 1. esearch – get all matching PMIDs
+    all_pmids: list = []
+    retstart  = 0
+    batch     = 200
+
+    while len(all_pmids) < cap:
+        try:
+            resp = requests.get(PUBMED_ESEARCH, params={
+                "db":       "pubmed",
+                "term":     term,
+                "retmax":   min(batch, cap - len(all_pmids)),
+                "retstart": retstart,
+                "retmode":  "json",
+                "sort":     "date",
+            }, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()["esearchresult"]
+        except Exception as e:
+            print(f"  [!] PubMed esearch error: {e}")
+            break
+
+        ids = data.get("idlist", [])
+        if not ids:
+            break
+        all_pmids.extend(ids)
+        total = int(data.get("count", 0))
+        print(f"  fetched {len(all_pmids)}/{min(total, cap)} PMIDs", end="\r")
+
+        if len(all_pmids) >= total or len(ids) < batch:
+            break
+        retstart += len(ids)
+        time.sleep(PUBMED_DELAY)
+
+    if not all_pmids:
+        print(f"\n  Found 0 PubMed papers.")
+        return []
+
+    # 2. efetch – get full XML in batches of 50
+    papers: list = []
+    efetch_batch = 50
+    for i in range(0, len(all_pmids), efetch_batch):
+        chunk = all_pmids[i : i + efetch_batch]
+        xml   = _pubmed_fetch_xml(chunk)
+        papers.extend(_parse_pubmed_xml(xml))
+        time.sleep(PUBMED_DELAY)
+
+    print(f"\n  Found {len(papers)} PubMed papers.")
+    return papers
+
+
+# =============================================================================
+# bioRxiv search via Europe PMC (indexes all bioRxiv preprints, keyword-searchable)
+# =============================================================================
+
+EUROPEPMC_API   = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+EUROPEPMC_BATCH = 100
+
+
+def search_biorxiv(query: str, start_date: str, end_date: str,
+                   max_papers: Optional[int]) -> list:
+    """
+    Search bioRxiv preprints via the Europe PMC REST API.
+    Europe PMC indexes all bioRxiv papers with full keyword search support.
+    No scraping — official JSON API, no authentication required.
+    """
+    cap = max_papers or 200
+
+    # Europe PMC query: keyword + journal filter + date range
+    epmc_query = (f'({query}) AND JOURNAL:"bioRxiv" AND '
+                  f'FIRST_PDATE:[{start_date} TO {end_date}]')
+
+    print(f"\n[bioRxiv/EuropePMC] query={query!r}  {start_date} -> {end_date}"
+          f"  cap={max_papers or 'unlimited'}")
+
+    papers: list = []
+    seen:   set  = set()
+    cursor  = "*"
+
+    while len(papers) < cap:
+        try:
+            resp = requests.get(EUROPEPMC_API, params={
+                "query":      epmc_query,
+                "format":     "json",
+                "resultType": "core",
+                "pageSize":   min(EUROPEPMC_BATCH, cap - len(papers)),
+                "cursorMark": cursor,
+            }, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            print(f"  [!] Europe PMC error: {e}")
+            break
+
+        items = data.get("resultList", {}).get("result", [])
+        if not items:
+            break
+
+        for item in items:
+            doi    = (item.get("doi") or "").strip()
+            pmcid  = (item.get("pmcid") or "").strip().lstrip("PMC")
+            title  = (item.get("title") or "").strip()
+            # Deduplicate by DOI if present, else by title hash
+            dedup_key = doi or hashlib.md5(title.lower().encode()).hexdigest()
+            if not title or dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+
+            abstract = (item.get("abstractText") or "").strip()
+            pub_date = (item.get("firstPublicationDate") or "")[:10]
+
+            # Authors
+            authors = []
+            for au in (item.get("authorList") or {}).get("author", []):
+                name = (au.get("fullName") or
+                        f"{au.get('firstName','')} {au.get('lastName','')}".strip())
+                if name:
+                    authors.append(name)
+
+            # PDF URL priority:
+            # 1. Direct bioRxiv URL when DOI is a 10.1101/ preprint
+            # 2. PMC OA API direct link when PMC ID is available
+            # 3. Any PDF link from fullTextUrlList
+            # 4. Fallback to DOI-based URL
+            pdf_url = ""
+            if doi.startswith("10.1101/"):
+                pdf_url = f"https://www.biorxiv.org/content/{doi}.full.pdf"
+            elif pmcid:
+                pdf_url = _resolve_pmc_pdf_url(pmcid)
+            if not pdf_url:
+                for link in (item.get("fullTextUrlList") or {}).get("fullTextUrl", []):
+                    if link.get("documentStyle") == "pdf":
+                        candidate = link.get("url", "")
+                        if candidate:
+                            pdf_url = candidate
+                            break
+            if not pdf_url and doi:
+                pdf_url = f"https://doi.org/{doi}"
+
+            # Stable ID: bioRxiv DOI > PMC ID > EPMC item ID > MD5
+            if doi.startswith("10.1101/"):
+                short_id = re.sub(r"[^\w.]", "_", doi.replace("10.1101/", ""))
+            elif pmcid:
+                short_id = f"PMC{pmcid}"
+            elif item.get("id"):
+                short_id = re.sub(r"[^\w.]", "_", item["id"])
+            else:
+                short_id = hashlib.md5(title.lower().encode()).hexdigest()[:12]
+
+            papers.append({
+                "arxiv_id":  f"biorxiv_{short_id}",
+                "title":      title,
+                "abstract":   abstract,
+                "pdf_url":    pdf_url,
+                "authors":    authors,
+                "published":  pub_date,
+                "source":     "biorxiv",
+                "doi":        doi,
+            })
+            if len(papers) >= cap:
+                break
+
+        total = data.get("hitCount", "?")
+        print(f"  cursor={cursor[:8]}…  batch={len(items)}"
+              f"  matched={len(papers)}  total={total}", end="\r")
+
+        next_cursor = data.get("nextCursorMark", "")
+        if not next_cursor or next_cursor == cursor or len(items) < EUROPEPMC_BATCH:
+            break
+        cursor = next_cursor
+        time.sleep(0.5)
+
+    print(f"\n  Found {len(papers)} bioRxiv papers.")
+    return papers
+
+
+# =============================================================================
+# Semantic Scholar search
+# =============================================================================
+
+S2_SEARCH_API = "https://api.semanticscholar.org/graph/v1/paper/search"
+S2_FIELDS     = ("paperId,title,abstract,authors,year,publicationDate,"
+                 "externalIds,openAccessPdf,venue")
+S2_DELAY      = 1.1   # free tier: ~1 req/s
+
+
+def search_semantic_scholar(query: str, start_date: str, end_date: str,
+                             max_papers: Optional[int]) -> list:
+    """Search Semantic Scholar via the public paper-search API."""
+    cap      = max_papers or 500
+    year_low = int(start_date[:4])
+    year_hi  = int(end_date[:4])
+
+    print(f"\n[S2] query={query!r}  {start_date} -> {end_date}"
+          f"  cap={max_papers or 'unlimited'}")
+
+    papers: list = []
+    seen:   set  = set()
+    offset  = 0
+    limit   = min(100, cap)
+
+    while len(papers) < cap:
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = requests.get(S2_SEARCH_API, params={
+                    "query":  query,
+                    "fields": S2_FIELDS,
+                    "limit":  limit,
+                    "offset": offset,
+                }, timeout=60)
+                if resp.status_code == 429:
+                    wait = int(resp.headers.get("Retry-After", 10)) + 2
+                    print(f"\n  [S2] Rate limited, waiting {wait}s ...")
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except requests.exceptions.HTTPError:
+                print(f"  [!] Semantic Scholar API error: {resp.status_code}")
+                data = {}
+                break
+            except Exception as e:
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                print(f"  [!] Semantic Scholar API error: {e}")
+                data = {}
+                break
+        else:
+            data = {}
+
+        if not data:
+            break
+
+        items = data.get("data", [])
+        if not items:
+            break
+
+        for item in items:
+            pid = item.get("paperId", "")
+            if not pid or pid in seen:
+                continue
+
+            title = (item.get("title") or "").strip()
+            if not title:
+                continue
+
+            # Year filter
+            year = item.get("year") or 0
+            if year and (year < year_low or year > year_hi):
+                continue
+
+            seen.add(pid)
+            abstract = (item.get("abstract") or "").strip()
+
+            # Date
+            pub_date = (item.get("publicationDate") or
+                        (f"{year}-01-01" if year else ""))
+
+            # Authors
+            authors = [a.get("name", "") for a in (item.get("authors") or [])]
+
+            # PDF: prefer openAccessPdf, then arXiv, then DOI
+            oap     = item.get("openAccessPdf") or {}
+            pdf_url = oap.get("url", "")
+            ext_ids = item.get("externalIds") or {}
+            if not pdf_url:
+                arxiv_id_s2 = ext_ids.get("ArXiv", "")
+                if arxiv_id_s2:
+                    pdf_url = f"https://arxiv.org/pdf/{arxiv_id_s2}.pdf"
+            if not pdf_url:
+                doi_s2 = ext_ids.get("DOI", "")
+                if doi_s2:
+                    pdf_url = f"https://doi.org/{doi_s2}"
+
+            # Stable ID: prefer arXiv ID, else S2 ID
+            arxiv_s2 = ext_ids.get("ArXiv", "")
+            stable_id = arxiv_s2 if arxiv_s2 else f"s2_{pid[:12]}"
+
+            papers.append({
+                "arxiv_id":  stable_id,
+                "title":      title,
+                "abstract":   abstract,
+                "pdf_url":    pdf_url,
+                "authors":    authors,
+                "published":  pub_date[:10] if pub_date else "",
+                "source":     "semantic_scholar",
+                "venue":      (item.get("venue") or ""),
+            })
+            if len(papers) >= cap:
+                break
+
+        total = data.get("total", "?")
+        print(f"  offset={offset}  batch={len(items)}"
+              f"  matched={len(papers)}  total={total}", end="\r")
+
+        if len(items) < limit:
+            break
+        offset += len(items)
+        time.sleep(S2_DELAY)
+
+    print(f"\n  Found {len(papers)} Semantic Scholar papers.")
+    return papers
+
+
+# =============================================================================
 # Multi-source search + deduplication
 # =============================================================================
 
@@ -360,30 +830,57 @@ def _norm_title(t: str) -> str:
     return re.sub(r"[^a-z0-9]", "", t.lower())
 
 
-def search_papers(source: str, query: str, start_date: str,
+VALID_SOURCES = {"arxiv", "scholar", "pubmed", "biorxiv", "semantic_scholar"}
+SOURCE_ALIASES = {
+    "bio": ["pubmed", "biorxiv", "arxiv"],
+    "all": ["arxiv", "scholar", "pubmed", "biorxiv", "semantic_scholar"],
+}
+SOURCE_FN = {
+    "arxiv":            search_arxiv,
+    "scholar":          search_scholar,
+    "pubmed":           search_pubmed,
+    "biorxiv":          search_biorxiv,
+    "semantic_scholar": search_semantic_scholar,
+}
+
+
+def _resolve_sources(raw: list) -> list:
+    """Expand aliases, deduplicate, preserve order."""
+    seen, result = set(), []
+    for s in raw:
+        for atomic in SOURCE_ALIASES.get(s, [s]):
+            if atomic not in seen:
+                seen.add(atomic)
+                result.append(atomic)
+    return result
+
+
+def search_papers(sources, query: str, start_date: str,
                   end_date: str, max_papers: Optional[int]) -> list:
     """
-    Dispatch to one or both sources, then deduplicate by normalized title.
-    source: 'arxiv' | 'scholar' | 'all'
+    Dispatch to one or more sources, then deduplicate by normalized title.
+    sources: str or list – any combination of
+        arxiv | scholar | pubmed | biorxiv | semantic_scholar | bio | all
     """
-    per_source = max_papers  # each source gets the full cap; dedup trims later
+    if isinstance(sources, str):
+        sources = sources.split()   # also handles single-word strings
+    sources = _resolve_sources(sources)
 
-    arxiv_results   = []
-    scholar_results = []
+    per_source = max_papers
+    combined   = []
+    for src in sources:
+        fn = SOURCE_FN.get(src)
+        if fn is None:
+            print(f"  [!] Unknown source '{src}', skipping.")
+            continue
+        results = fn(query, start_date, end_date, per_source)
+        for p in results:
+            p.setdefault("source", src)
+        combined.extend(results)
 
-    if source in ("arxiv", "all"):
-        arxiv_results = search_arxiv(query, start_date, end_date, per_source)
-        for p in arxiv_results:
-            p.setdefault("source", "arxiv")
-
-    if source in ("scholar", "all"):
-        scholar_results = search_scholar(query, start_date, end_date, per_source)
-
-    combined = arxiv_results + scholar_results
-
-    # Deduplicate by normalized title (keep first occurrence = arxiv preferred)
+    # Deduplicate by normalized title (first occurrence wins)
     seen: set = set()
-    deduped = []
+    deduped   = []
     for p in combined:
         key = _norm_title(p["title"])
         if key and key not in seen:
@@ -393,8 +890,8 @@ def search_papers(source: str, query: str, start_date: str,
     if max_papers:
         deduped = deduped[:max_papers]
 
-    if source == "all":
-        src_counts = {}
+    if len(sources) > 1:
+        src_counts: dict = {}
         for p in deduped:
             s = p.get("source", "?")
             src_counts[s] = src_counts.get(s, 0) + 1
@@ -406,12 +903,23 @@ def search_papers(source: str, query: str, start_date: str,
 # PDF download
 # =============================================================================
 
+def _is_valid_pdf(path: Path) -> bool:
+    """Check that the file starts with the PDF magic bytes %PDF."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"%PDF"
+    except Exception:
+        return False
+
+
 def _download_one(paper: dict, dest: Path, attempt: int = 0) -> Optional[Path]:
     dest.mkdir(parents=True, exist_ok=True)
     safe = re.sub(r"[^\w\-.]", "_", paper["arxiv_id"])
     out  = dest / f"{safe}.pdf"
-    if out.exists() and out.stat().st_size > 1024:
+    if out.exists() and out.stat().st_size > 1024 and _is_valid_pdf(out):
         return out
+    elif out.exists():
+        out.unlink()   # delete stale/corrupt cached file
     try:
         req = urllib.request.Request(
             paper["pdf_url"],
@@ -423,8 +931,8 @@ def _download_one(paper: dict, dest: Path, attempt: int = 0) -> Optional[Path]:
                 if not chunk:
                     break
                 f.write(chunk)
-        if out.stat().st_size < 1024:
-            raise ValueError("file too small")
+        if not _is_valid_pdf(out):
+            raise ValueError("response is not a PDF (got HTML or redirect page)")
         return out
     except Exception as e:
         if out.exists():
@@ -458,7 +966,7 @@ def download_all(papers: list, dest: Path) -> dict:
 # =============================================================================
 
 def call_llm(prompt: str, model: str = DEFAULT_MODEL,
-             temperature: float = 0.3, max_tokens: int = 2500) -> str:
+             temperature: float = 0.3, max_tokens: int = 4000) -> str:
     if not LLM_API_KEY:
         return "[ERROR] LLM_API_KEY is empty. Check api_key.txt."
     headers = {
@@ -652,26 +1160,140 @@ def get_prompts(lang: str) -> tuple:
     return DEEP_ANALYSIS_EN, SYNTHESIS_EN
 
 # =============================================================================
-# Analysis
+# Reference extraction
 # =============================================================================
 
+# Matches bare arXiv IDs like 2301.12345 or 2301.12345v2, with optional
+# "arXiv:" or "arxiv.org/abs/" prefix.
+_ARXIV_ID_RE = re.compile(
+    r'(?:arxiv\s*[:/]\s*|arxiv\.org/(?:abs|pdf)/)?(\d{4}\.\d{4,5}(?:v\d+)?)',
+    re.IGNORECASE
+)
+
+
+def extract_arxiv_ids_from_text(text: str) -> list:
+    """Return unique arXiv IDs (version-stripped) found in *text*."""
+    seen, ids = set(), []
+    for m in _ARXIV_ID_RE.finditer(text):
+        base = re.sub(r'v\d+$', '', m.group(1))
+        if base not in seen:
+            seen.add(base)
+            ids.append(base)
+    return ids
+
+
+def fetch_papers_by_ids(arxiv_ids: list) -> list:
+    """Fetch paper metadata for a list of arXiv IDs via the arXiv API."""
+    if not arxiv_ids:
+        return []
+    papers = []
+    ns = "{http://www.w3.org/2005/Atom}"
+    batch_size = 50
+    for i in range(0, len(arxiv_ids), batch_size):
+        batch = arxiv_ids[i : i + batch_size]
+        id_list = ",".join(batch)
+        url = f"{ARXIV_API}?id_list={urllib.parse.quote(id_list)}&max_results={len(batch)}"
+        try:
+            with urllib.request.urlopen(url, timeout=60) as resp:
+                raw = resp.read()
+        except Exception as e:
+            print(f"  [!] Failed to fetch ID batch: {e}")
+            continue
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError:
+            continue
+        for entry in root.findall(f"{ns}entry"):
+            id_tag = entry.find(f"{ns}id")
+            if id_tag is None:
+                continue
+            arxiv_id = re.sub(r'v\d+$', '', id_tag.text.strip().split("/")[-1])
+
+            def _t(tag):
+                el = entry.find(f"{ns}{tag}")
+                return el.text.strip() if el is not None and el.text else ""
+
+            title   = _t("title").replace("\n", " ")
+            summary = _t("summary").replace("\n", " ")
+            pub     = _t("published")
+            authors = [a.find(f"{ns}name").text.strip()
+                       for a in entry.findall(f"{ns}author")
+                       if a.find(f"{ns}name") is not None]
+            pdf_url = next(
+                (lnk.attrib["href"] for lnk in entry.findall(f"{ns}link")
+                 if lnk.attrib.get("title") == "pdf"),
+                f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+            )
+            if title:
+                papers.append({
+                    "arxiv_id":  arxiv_id,
+                    "title":     title,
+                    "abstract":  summary,
+                    "pdf_url":   pdf_url,
+                    "authors":   authors,
+                    "published": pub[:10],
+                    "source":    "arxiv",
+                })
+        time.sleep(REQUEST_DELAY)
+    return papers
+
+
+def crawl_references(pdf_map: dict, known_ids: set,
+                     papers_dir: Path, depth: int) -> tuple:
+    """
+    Recursively follow arXiv references up to *depth* hops.
+    Returns (new_papers, updated_pdf_map).
+    """
+    if depth <= 0:
+        return [], {}
+
+    print(f"\n[Refs] Scanning {len(pdf_map)} PDFs for arXiv references (depth={depth}) ...")
+    ref_ids = set()
+    for arxiv_id, pdf_path in pdf_map.items():
+        # Use a larger char limit to reach reference sections at end of papers
+        text = extract_text_from_pdf(pdf_path, char_limit=80000)
+        for rid in extract_arxiv_ids_from_text(text):
+            if rid not in known_ids:
+                ref_ids.add(rid)
+
+    if not ref_ids:
+        print("  No new referenced arXiv IDs found.")
+        return [], {}
+
+    print(f"  Found {len(ref_ids)} new referenced arXiv IDs — fetching metadata ...")
+    ref_papers = fetch_papers_by_ids(list(ref_ids))
+    # Deduplicate against known set
+    ref_papers = [p for p in ref_papers if p["arxiv_id"] not in known_ids]
+    print(f"  Downloading {len(ref_papers)} referenced papers ...")
+    new_pdf_map = download_all(ref_papers, papers_dir)
+
+    # Update known set for next hop
+    updated_known = known_ids | {p["arxiv_id"] for p in ref_papers}
+    # Recurse
+    deeper_papers, deeper_map = crawl_references(
+        new_pdf_map, updated_known, papers_dir, depth - 1
+    )
+    all_papers  = ref_papers  + deeper_papers
+    all_pdf_map = {**new_pdf_map, **deeper_map}
+    return all_papers, all_pdf_map
+
+
+
 def analyze_paper(paper: dict, pdf_path: Optional[Path],
-                  model: str, lang: str) -> dict:
+                  model: str, lang: str) -> Optional[dict]:
     print(f"  Analyzing: {paper['title'][:72]}...")
     deep_prompt, _ = get_prompts(lang)
 
-    if pdf_path and PDF_BACKEND:
-        text   = extract_text_from_pdf(pdf_path)
-        source = "full PDF"
-    else:
-        text   = f"Title: {paper['title']}\n\nAbstract:\n{paper['abstract']}"
-        source = "abstract only"
+    if not (pdf_path and PDF_BACKEND):
+        print(f"    [Skip] No PDF available for '{paper['arxiv_id']}'")
+        return None
 
+    text = extract_text_from_pdf(pdf_path)
     if not text.strip() or text.startswith("[PDF"):
-        text   = f"Title: {paper['title']}\n\nAbstract:\n{paper['abstract']}"
-        source = "abstract only (PDF parse failed)"
+        print(f"    [Skip] Full-text extraction failed for '{paper['arxiv_id']}'")
+        return None
 
-    analysis = call_llm(deep_prompt.format(paper_text=text), model=model)
+    analysis = call_llm(deep_prompt.format(paper_text=text), model=model, max_tokens=4000)
 
     return {
         "arxiv_id":     paper["arxiv_id"],
@@ -681,7 +1303,7 @@ def analyze_paper(paper: dict, pdf_path: Optional[Path],
         "pdf_url":      paper.get("pdf_url", ""),
         "abstract":     paper["abstract"],
         "paper_source": paper.get("source", "arxiv"),
-        "source":       source,   # text extraction source (full PDF / abstract only)
+        "source":       "full PDF",
         "analysis":     analysis,
     }
 
@@ -750,7 +1372,7 @@ Cover:
 4. **Major Research Groups & Venues** - leading labs, conferences, and journals.
 5. **Open Challenges** - the most pressing unsolved problems.
 
-Be concise (500-800 words), factual, and use technical language suitable for a graduate researcher.
+Be concise (800-1200 words), factual, and use technical language suitable for a graduate researcher.
 """
 
 OVERVIEW_PROMPT_ZH = """\
@@ -762,7 +1384,7 @@ OVERVIEW_PROMPT_ZH = """\
 4. **主要研究团队与发表渠道** — 领域内顶尖实验室、重要会议和期刊。
 5. **开放挑战** — 目前最迫切的未解决问题。
 
-字数控制在500-800字，语言专业，适合研究生阅读。
+字数控制在800-1200字，语言专业，适合研究生阅读。
 """
 
 
@@ -772,7 +1394,7 @@ def write_index_md(topic: str, results: list, out_dir: Path,
 
     print(f"\n[Index] Generating topic overview for '{topic}' ...")
     prompt   = (OVERVIEW_PROMPT_ZH if lang == "zh" else OVERVIEW_PROMPT_EN).format(topic=topic)
-    overview = call_llm(prompt, model=model, max_tokens=3000)
+    overview = call_llm(prompt, model=model, max_tokens=4000)
 
     src_label = {"arxiv": "arXiv", "scholar": "Google Scholar"}
     with open(path, "w", encoding="utf-8") as f:
@@ -855,9 +1477,15 @@ def parse_args():
                    help="Report language: en=English, zh=Chinese")
     p.add_argument("--pdf",    action="store_true",
                    help="Render all Markdown output files to PDF via pandoc")
-    p.add_argument("--source",  default="arxiv",
-                   choices=["arxiv", "scholar", "all"],
-                   help="Paper source: arxiv | scholar | all (both, deduplicated)")
+    p.add_argument("--source", "-S", nargs="+", default=["arxiv"],
+                   metavar="SRC",
+                   help=("One or more paper sources (space-separated): "
+                         "arxiv scholar pubmed biorxiv semantic_scholar "
+                         "bio(=pubmed+biorxiv+arxiv) all"))
+    p.add_argument("--refs",      action="store_true",
+                   help="Crawl arXiv references from downloaded PDFs and include them")
+    p.add_argument("--ref-depth", type=int, default=1,
+                   help="How many hops of reference crawling (default: 1, requires --refs)")
     p.add_argument("--no-download",  action="store_true",
                    help="Skip PDF download; analyze abstract text only")
     p.add_argument("--no-synthesis", action="store_true",
@@ -874,11 +1502,20 @@ def main():
     model      = args.model
     lang       = args.lang
 
+    # Validate sources
+    all_known = VALID_SOURCES | set(SOURCE_ALIASES)
+    bad = [s for s in args.source if s not in all_known]
+    if bad:
+        print(f"[ERROR] Unknown source(s): {bad}")
+        print(f"        Valid: {sorted(all_known)}")
+        sys.exit(1)
+    sources_display = " ".join(args.source)
+
     print("=" * 65)
     print("   arXiv Topic Deep Analyzer  --  " + model)
     print("=" * 65)
     print(f"  Topic    : {topic}")
-    print(f"  Source   : {args.source}")
+    print(f"  Source   : {sources_display}")
     print(f"  Dates    : {start_date} -> {end_date}")
     print(f"  Cap      : {max_papers or 'unlimited'}")
     print(f"  Model    : {model}")
@@ -905,13 +1542,32 @@ def main():
     else:
         print("\n[Download] Skipped (--no-download).")
 
+    # 2b. Reference crawling
+    if args.refs and not args.no_download:
+        known_ids   = {p["arxiv_id"] for p in papers}
+        ref_papers, ref_pdf_map = crawl_references(
+            pdf_map, known_ids, papers_dir, args.ref_depth
+        )
+        if ref_papers:
+            print(f"  Adding {len(ref_papers)} referenced papers to analysis set.")
+            papers.extend(ref_papers)
+            pdf_map.update(ref_pdf_map)
+    elif args.refs and args.no_download:
+        print("\n[Refs] Skipped (--no-download disables reference crawling).")
+
     # 3. Per-paper analysis
     print(f"\n[Analysis] Analyzing {len(papers)} papers with '{model}' ...")
     md_files = []
     results  = []
     for i, paper in enumerate(papers, 1):
         print(f"\n  [{i}/{len(papers)}] ", end="")
+        # Skip papers that failed to download (only when download is active)
+        if not args.no_download and paper["arxiv_id"] not in pdf_map:
+            print(f"  [Skip] Download failed — {paper['title'][:60]}")
+            continue
         result = analyze_paper(paper, pdf_map.get(paper["arxiv_id"]), model, lang)
+        if result is None:
+            continue
         md     = write_paper_md(result, session_dir, lang)
         md_files.append(md)
         results.append(result)
@@ -924,10 +1580,10 @@ def main():
         combined = "\n\n---\n\n".join(
             f"### Paper {i}: {r['title']} ({r['published']})\n{r['analysis']}"
             for i, r in enumerate(results, 1)
-        )[:30000]
+        )[:60000]
         synthesis = call_llm(
             synth_prompt.format(n=len(results), topic=topic, analyses=combined),
-            model=model, max_tokens=3000,
+            model=model, max_tokens=5000,
         )
         syn_path = write_synthesis_md(topic, results, synthesis, session_dir, lang)
         md_files.append(syn_path)
